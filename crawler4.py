@@ -16,12 +16,10 @@ import json, HTMLParser
 
 monkey.patch_all(thread=False)
 
-playScoreUrl = 'http://p.eagate.573.jp/game/jubeat/saucer/p/playdata/music.html?rival_id=%d&page=%d'
-musicPageUrl = 'http://p.eagate.573.jp/game/jubeat/saucer/p/playdata/music_detail.html?rival_id=%d&mid=%d'
-playHistoryUrl = 'http://p.eagate.573.jp/game/jubeat/saucer/p/playdata/history.html?rival_id=%d&page=%d'
-contestListUrl = 'http://p.eagate.573.jp/game/jubeat/saucer/p/contest/join_info.html?s=1&rival_id=%d'
-contestDataUrl = 'http://p.eagate.573.jp/game/jubeat/saucer/p/contest/detail.html?contest_id=%d'
-playerInfoUrl = 'http://p.eagate.573.jp/game/jubeat/saucer/p/playdata/index_other.html?rival_id={0}'
+playScoreUrl = 'http://p.eagate.573.jp/game/jubeat/prop/p/playdata/music.html?rival_id=%d&sort=&page=%d'
+musicPageUrl = 'http://p.eagate.573.jp/game/jubeat/prop/p/playdata/music_detail.html?rival_id=%d&mid=%d'
+playHistoryUrl = 'http://p.eagate.573.jp/game/jubeat/prop/p/playdata/history.html?rival_id=%d'
+playerInfoUrl = 'http://p.eagate.573.jp/game/jubeat/prop/p/playdata/index_other.html?rival_id={0}'
 
 def getRedis():
   return redis.Redis(db=11)
@@ -265,81 +263,6 @@ def login(kid=None, password=None):
     logging.error('login failed')
     return False
 
-def getContestPeriod(unicode_date):
-  date = [ datetime.strptime(_.encode('utf-8').strip(), u'%m月%d日 %H時'.encode('utf-8')) for _ in unicode_date.split(u'〜') ]
-  year = [ datetime.now().year, datetime.now().year ]
-  if date[0].month > datetime.now().month:
-    year[0] -= 1
-  if date[0] > date[1]:
-    year[1] += 1
-  return [ datetime(y, d.month, d.day, d.hour).strftime('%Y/%m/%d %H:%M:%S') for y, d in zip(year, date) ] 
-
-def updateContestInfo(rival_id):
-  try:
-    r = getRedis()
-    
-    c = getHttpContents(contestListUrl%rival_id)
-    if c is None:
-      return
-    
-    table = c.find(id='contest_list')
-    if table is None:
-      return
-    rows = table.findAll('tr')
-    for row in rows:
-      cs = row.findAll('td')
-      if len(cs) == 0:
-        continue
-      contest_info = dict(zip(['name', 'id', 'owner'], [ _.text for _ in cs[:3]]))
-      contest_info.update(dict(zip(['start', 'end'], getContestPeriod(cs[3].text))))
-      if r.hexists('ignore_contest', contest_info['id']):
-        continue
-      key = 'contest_info:' + contest_info['id']
-      if not r.exists(key):
-        r.hmset(key, contest_info)
-        if now() >= contest_info['start'] and now() <= contest_info['end']:
-          cur_key = 'current_contest:' + contest_info['id']
-          r.set(cur_key, 1)
-          r.expireat(cur_key, dateToTime(contest_info['end'])+600)
-
-  except Exception, e:
-    logging.error('updateContestInfo Error: %s(%d)'%(e, rival_id))
-    return
-
-def updateContestData(contest_id):
-  try:
-    c = getHttpContents(contestDataUrl%contest_id)
-    if c is None:
-      return set()
-    
-    r = getRedis()
-    members_key = 'contest_members:%d'%contest_id
-    music_list_key = 'music_list:%d'%contest_id
-    if not r.exists(music_list_key):
-      table = c.find(id='contest_theme')
-      rows = table.findAll('tr', attrs={'class':'theme'})
-      for row in rows:
-        cols = row.findAll('td')
-        music_title = unescape(cols[1].text)
-        difficulty = DifficultyString[int(cols[2].find('img')['alt'])]
-        music = music_title + ':' + difficulty
-        r.rpush(music_list_key, music)
-
-    rows = c.find(id='contest_ranking').findAll('a')
-    for row in rows:
-      rival_id = row['href'][row['href'].index(u'=')+1:]
-      r.hset('rival_id', rival_id, row.text)
-      r.sadd(members_key, rival_id)
-
-    members = r.smembers(members_key)
-    if members is None:
-      return set()
-
-    return members
-
-  except Exception, e:
-    logging.error('getContestData Error: %s(%d)'%(e, contest_id))
-    return set()
 
 def getMusicScorePage(url):
   for i in xrange(10):
@@ -426,11 +349,8 @@ def getUserHistory(rival_id):
 
     playHistory = []
     up_to_date = False
-    c = getHttpContents(playHistoryUrl%(rival_id, 1))
-    pages = c.find(attrs={"class":"pager"}).findAll(attrs={"class":"number"})
-    for page in pages:
-      i = int(page.text)
-      c = getHttpContents(playHistoryUrl%(rival_id, i))
+    c = getHttpContents(playHistoryUrl%(rival_id))
+    for page in [1]: # page 기능이 사라져 있어서 일단은 이렇게..
       if c is None:
         return []
       
@@ -500,56 +420,6 @@ def getUserHistory(rival_id):
     logging.error('getUserHistory Error: %s(%d)'%(e, rival_id))
     return []
 
-def updateContestHistory():
-  try:
-    r = getRedis()
-    
-    current_contest_list = [ int(_[16:]) for _ in r.keys('current_contest:*') ]
-    jobs = [ gevent.spawn(updateContestData, contest_id) for contest_id in current_contest_list ]
-    gevent.joinall(jobs)
-    
-    contest_members = dict(zip(current_contest_list, [ job.value for job in jobs ]))
-
-    member_list = r.hgetall('rival_id')
-    [ getUserScore(int(rival_id)) for rival_id in member_list.iterkeys() if not r.exists(('score:%s'%rival_id)) ]
-    jobs = [ gevent.spawn(getUserHistory, int(rival_id)) for rival_id, user in member_list.iteritems() ]
-    gevent.joinall(jobs)
-    
-    playdata = dict(zip(member_list.keys(), [ _.value for _ in jobs ]))
-    r.ltrim('recent_history', 0, 200)
-
-    for contest_id, members in contest_members.iteritems():
-      contest_history_key = 'contest_history:{0}'.format(contest_id)
-      contest_records_key = 'contest_records:{0}'.format(contest_id)
-      contest_info_key = 'contest_info:{0}'.format(contest_id)
-      
-      contest_info = r.hgetall(contest_info_key)
-      music_list = r.lrange('music_list:{0}'.format(contest_id), 0, -1)
-      
-      logging.info('update contest <{0}>'.format(contest_info['name']))
-      update_users = filter(lambda _: (_ in playdata and len(playdata[_]) is not 0) or (not r.hexists(contest_records_key, _)), members)
-      contest_history = []
-      for user in update_users:
-        user_record = r.hget(contest_records_key, user)
-        if user_record is None:
-          user_record = [ 0 for i in music_list ]
-        else:
-          user_record = [ int(score) for score in user_record.split(':') ]
-        for data in playdata[user]:
-          if data[1] in music_list and data[3] >= contest_info['start'] and data[3] <= contest_info['end'] :
-            idx = music_list.index(data[1])
-            contest_history.append(data[0])
-            user_record[idx] = max(user_record[idx], data[2])
-        r.hset(contest_records_key, user, ':'.join([str(_) for _ in user_record]))
-      contest_history.sort()
-      logging.info('add {0} histories'.format(len(contest_history)))
-      map(lambda _: r.lpush(contest_history_key, _), contest_history)
-      r.hset('contest_info:{0}'.format(contest_id), 'last_update', now())
-
-  except Exception, e:
-    logging.error('updateContestHistory Error: %s'%e)
-    return
-
 def registerUser(rival_id, user_name, update_contest=True, update_score=True):
   try:
     r = getRedis()
@@ -573,9 +443,6 @@ def registerUser(rival_id, user_name, update_contest=True, update_score=True):
       return False
 
     r.hset('rival_id', rival_id, user_name)
-    
-    if update_contest:
-      updateContestInfo(int(rival_id))
 
     if update_score:
       getUserScore(int(rival_id))
