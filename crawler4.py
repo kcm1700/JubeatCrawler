@@ -13,6 +13,7 @@ from datetime import datetime, timedelta
 from BeautifulSoup import BeautifulSoup
 import sys, traceback
 import json, HTMLParser
+import re
 
 monkey.patch_all(thread=False)
 
@@ -340,10 +341,35 @@ def getUserScore(rival_id):
     logging.error('getUserScore Error: %s(%d)'%(e, rival_id))
     return []
 
+# 플레이 이력의 문자열을 분해.
+# raw (unicode string): プレー日時：2015/2/23 18:37 プレー店舗：大韓民国 / ＳｏｏｎｇＳｉｌｇａｍｅｌａｎｄ
+# returns (unicode string * unicode string):
+#   (normalized date u"%04d/%02d/%02d %02d:%02d:%02d", place)
+def parseDatePlace(raw):
+  date_label = u'プレー日時：'
+  place_label = u'プレー店舗：'
+
+  if date_label == -1 or place_label == -1:
+    raise RuntimeError('no label found', raw)
+
+  date_index = raw.find(date_label) + len(date_label)
+  place_index = raw.find(place_label) + len(place_label)
+
+  date_match = re.match(u'([0-9]*)\/([0-9]*)\/([0-9]*) ([0-9]*\:[0-9]*).*', raw[date_index:])
+  year = int(date_match.group(1))
+  month = int(date_match.group(2))
+  day = int(date_match.group(3))
+  tm = date_match.group(4)
+
+  norm_date = u'{year:04}/{month:02}/{day:02} {tm}'.format(year=year, month=month, day=day, tm=tm)
+  norm_place = unicodedata.normalize('NFKC', raw[place_index:])
+  return (norm_date, norm_place)
+
 def getUserHistory(rival_id):
   try:
     r = getRedis()
     last_update = r.hget('last_update', rival_id)
+    last_update = last_update and last_update.decode('utf-8')
     update_date = last_update
     user_name = r.hget('rival_id', rival_id).decode('utf-8')
 
@@ -362,8 +388,10 @@ def getUserHistory(rival_id):
 
       for row in rows:
         playdata = {}
-        playdata['date'] = row.find(attrs={'class':'data1_info'}).text[6:25]
-        playdata['place'] = unicodedata.normalize('NFKC', row.find(attrs={'class':'data1_info'}).text[32:])
+
+        date, place = parseDatePlace(unescape(row.find(attrs={'class':'data1_info'}).text))
+        playdata['date'] = date
+        playdata['place'] = place
         playdata['music'] = unescape(row.find(attrs={'class':'result_music'}).find('a').text)
         playdata['difficulty'] = DifficultyString[int(row.find(attrs={'class':'level'}).find('img')['src'][-5:-4])]
         playdata['score'] = row.findAll('li')[-1].text.split('/')[0]
